@@ -1,0 +1,2470 @@
+---
+title: "EAE Analysis for Continuous QTVs"
+author: Anna L Tyler, modified by Lauren A. Downs
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: 
+  html_document:
+    code_folding: hide
+    collapsed: no
+    toc: yes
+    toc_float: yes
+bibliography: eae.bib
+---
+
+## Introduction
+The purpose of this workflow is to build on the analysis done by Dr. Emily Nelson, 
+Anna Tyler, and Dr. Dimitry Krementsov on a panel of Collaboraitve Cross mice that 
+were used to model the heterogeneity of Multiple Sclerosis (MS) using [experimental autoimmune 
+enchephalomyelitis (EAE)](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3229753/), a well established mouse model of the disease.
+
+In this model, mice are injected with CNS antigens which cause
+development of autoimmunity which results in clinical symptoms (weight loss, ataxia, paralysis) as well as measurable pathology in the brain and spinal cord.
+Previously, the Krementsov lab has identified multiple types of EAE that mirror
+the human experience better than the standard model, including potential models for different subtypes of MS. Similarly, potentially novel patterns were seen in the histopathology of some strains used in this experiment.
+
+In this study, we will try to map genetic variants that 
+are associated with weight change from EAE. Previous data describing the severity of clinical symptoms, known as a Cummulative Disease Score (CDS), will be used as control. Weight change is used because this is a continuous variable and thus will likely map differently than a more binned or discrete metric.
+
+For reference, [Emily's paper](https://pmc.ncbi.nlm.nih.gov/articles/PMC11601571/) provides more background and the foundation for this project. 
+
+### Collecting and Processing Data
+
+Using the files that Anna had previously compiled as well as some of Emily Nelson's data, I made a new 'September 2025' CDS file where I added a column for average weight change and average weight loss (average weight change * -1). These are percentages calculated based on the weight of a mouse over the course of the experiment 
+
+
+Note: Any code that was edited or made with ChatGPT will be noted within in-line comments.
+
+```{r get_arguments}
+rm(list = ls())
+
+#===============================================================
+#These are the hard-coded parameters used for the CDS Analysis
+#===============================================================
+#args <- commandArgs(trailingOnly=T)
+#b6_correction <- as.logical(args[1]) #Use B6 score to do batch correction
+#batch_as_covar <- as.logical(args[2]) #use batch as a covariate
+#rank_norm <- as.logical(args[3]) #whether to rank Z normalize adjusted scores.
+#===============================================================
+
+
+
+#===============================================================
+#hard code the final decisions on corrections and normalizations
+#set final_param to FALSE to use the arguments again
+#===============================================================
+final_param = TRUE
+
+if(final_param){
+    b6_correction <- FALSE
+    batch_as_covar <- TRUE
+    rank_norm <- TRUE
+}
+#===============================================================
+
+genotypes <- c("MRCA", "sequenced")
+genotypes <- genotypes[2]
+
+if(is.na(b6_correction) || length(b6_correction) == 0){
+b6_correction = FALSE; batch_as_covar = FALSE; rank_norm = FALSE
+}
+
+if(b6_correction && batch_as_covar){stop("Set either b6_correction or batch_as_covar to TRUE, not both.")}
+
+alpha <- c(0.15, 0.2)
+```
+
+```{r load_code}
+library(here)
+
+all.fun <- list.files(here("Code"), full.names = TRUE, pattern = ".R")
+for(i in 1:length(all.fun)){source(all.fun[i])}
+
+overwrite_previous <- FALSE # make this true whenever you add new data that you want fully analyzed; this WILL take longer and may not work on a low powered machine
+add_founder_genotypes <- FALSE
+
+#strains identified by remove_strains are excluded from all 
+#manipulations including normalization and batch corrections.
+#justficiations are as follows:
+#CC027 - all but 2 were homozygous for the wrong genotype at the H2 locus
+#NOD and 129 - are not used for mapping, and were not included in all
+#batches, so we cannot use them for normalization
+#remove_strains <- NULL
+remove_strains <- c("CC027", "NOD", "129") 
+#remove_strains <- c("CC051", "CC059") #closely related
+#remove_strains <- c("CC051") #pick one of them to keep
+
+cc.color.scheme = "original"
+#cc.color.scheme = "new"
+
+#for CDS
+exclude.zeros = FALSE #if true, we exclude animals with a CDS of 0
+disease.thresh = 0 #maximum disease score considered disease-free
+
+cds.file.date = "March_2026" #date for CDS csv file to use in format month_year
+
+
+nperm = 1000
+
+if(nperm > 0){
+    run_permutations <- TRUE
+}else{
+    run_permutations <- FALSE
+}
+```
+
+## Parameters
+
+```{r param_text}
+if(add_founder_genotypes){
+    founders.included = "yes"
+}else{
+    founders.included = "no"
+}
+
+if(length(remove_strains) > 0){
+    strains.removed <- paste(remove_strains, collapse = ", ")
+}else{
+    strains.removed = "none"
+}
+
+if(!exclude.zeros){
+    zero.text <- "Zeros are included in CDS"
+    zero.treatment <- "included with"
+}else{
+    zero.text <- paste("Animals with scores of", disease.thresh, "and below are excluded from CDS.")
+    zero.treatment <- "excluded from"
+}
+
+if(b6_correction){
+    correction.text <- "Batch corrections were made using B6 CDS."
+    correction.label <- "B6-batch"
+}
+if(batch_as_covar){
+    correction.text <- "Batch corrections were done using batch as a covariate."
+    correction.label <- "covar-batch"
+}
+if(!b6_correction && !batch_as_covar){
+    correction.text <- "No batch corrections were done."
+    correction.label <- "no-batch"
+}
+
+if(rank_norm){
+    norm.text <- "Rank Z normalization was performed."
+    norm.label <- "rank-norm"
+}else{
+    norm.text <- "Rank Z normalization was not performed."
+    norm.label <- "no-norm"
+}
+
+file.label <- paste(correction.label, norm.label, genotypes, sep = "_")
+```
+
+The parameters for this run are as follows (based on previous CDS analysis):
+
+* Genotypes used: `r genotypes`
+
+* Founders included: `r founders.included`
+
+* CC Strains removed: `r strains.removed`
+
+* Treatment of zeros: `r zero.text`
+
+* Batch correction: `r correction.text`
+
+* Normalization: `r norm.text`
+
+```{r results_dir}
+results.dir <- here("Results", paste("Zeros", strsplit(zero.treatment, " ")[[1]][1], file.label, sep = "_"))
+if(!file.exists(results.dir)){dir.create(results.dir)}
+```
+
+```{r load_libraries, warning = FALSE, message = FALSE, error = FALSE}
+all.packages <- c("pheatmap", "qtl2", "ggplot2", "abind", "igraph", "knitr", "parallel",
+    "stringr", "grid")
+load_libraries(all.packages)
+cores = NULL #detectCores()-1 is the alternative code if the machine you are using has cores
+```
+
+Read in phenotype data.
+
+```{r load_data}
+if(cc.color.scheme == "original"){
+    strain.colors <- CCorigcolors
+}else{
+    strain.colors <- CCcolors
+}
+
+cds <- read.csv(here("Data", paste0("CDS_", cds.file.date, ".csv")), strip.white = TRUE)
+
+#take out any slashes in strain names
+cds[,"Strain"]  <- gsub("/", "", cds[,"Strain"], fixed = TRUE)
+
+
+```
+
+This run uses the CDS file from `r gsub("_", " ", cds.file.date)`.
+
+
+### Remove excluded strains
+
+If any strains need to be removed from the analysis, do 
+that now before any numbers are manipulated.
+
+
+```{r remove_strains}
+#remove any empty rows that were inserted to visually separate
+#the founders from the rest of the strains
+cds.data.idx <- which(!is.na(cds[,"ID"]))
+cds <- cds[cds.data.idx,]
+
+
+#remove specified strains from cds
+if(length(remove_strains) != 0){
+    remove.cds <- unlist(sapply(remove_strains, function(x) which(cds[,"Strain"] == x)))
+    cds <- cds[-remove.cds,]
+}
+
+
+```
+
+
+```{r batches}
+## CDS
+num.cds <- as.matrix(sapply(cds[,c("Global.CDS", "Avg.Weight.Change", "Avg.Weight.Loss", "Weight.D0")], as.numeric)) #had to change this with Chat to make the values numeric
+rownames(num.cds) <- cds[,"ID"]
+#set all scores equal to or lower than the disease threshold
+#to zero
+if(exclude.zeros){
+    num.cds[which(num.cds <= disease.thresh)] <- 0
+}
+
+factor.cds <- as.matrix(cds[,c("Strain", "Sex")])
+u_batch <- unique(cds[,"EXP"])
+
+#remove animals in batch 170 - these were validation, not part of the original experiment
+to.remove = "X170" 
+keep.batch <- which(u_batch != "X170")
+u_batch <- u_batch[keep.batch]
+
+keep.idx <- which(cds[,"EXP"] != "X170")
+cds <- cds[keep.idx,]
+num.cds <- num.cds[keep.idx,]
+factor.cds <- factor.cds[keep.idx,]
+
+batch.mat <- matrix(0, nrow = nrow(cds), ncol = length(u_batch))
+colnames(batch.mat) <- u_batch
+for(b in 1:ncol(batch.mat)){
+    batch.mat[which(cds[,"EXP"] == u_batch[b]),b] <- 1
+}
+cds.covar <- as.matrix(cbind(batch.mat, cds[,"Age.at.D0",drop=FALSE]))
+
+pheno.strains <- cds[,"Strain"]
+eae.strains <- unique(pheno.strains)
+
+
+```
+
+## Samples by strain
+
+The following heatmaps show how many individuals are in 
+each strain by sex combination per CDS.
+
+### CDS
+
+```{r sample_counts_cds, fig.width = 8, fig.height = 1.5}
+count.table <- table(cds[,c("Sex", "Strain")])
+strain.order <- c(3:ncol(count.table), 1,2)
+par(mar = c(1,4,4,2))
+imageWithText(count.table[,strain.order], use.pheatmap.colors = TRUE, 
+    col.text.shift = -1.4, row.text.shift = -2, col.text.adj = 0,
+    col.text.cex = 0.7, cex = 0.8, row.text.adj = 0.5)
+```
+
+
+## Data Distributions 
+
+### CDS Distribution {.tabset .tabset-fade .tabset-pills}
+
+Each day of the study, each mouse is given a disease CDS 
+score between 0 and 5, with lower numbers indicating less 
+disease. The cumulative disease score (CDS) for a given mouse
+is the sum of these scores over the course of the study.
+
+Similarly, the weight of each mouse was measured since weight loss can be a sign of increased disease severity in mouse models. These measurements were then averaged for each mouse and a resulting average weight Loss metric was created.
+
+The distributions of three scores and the average weight Loss are shown below. Classical
+is the classical presentation of paralysis used in the field.
+AR (axial rotary) scores an alternate form of paralysis.
+Global is the sum of the Classical and AR scores and gives
+an overall score of disease regardless of type. 
+Average weight Loss is, as the title implies, a metric describing whether the mice lost or gained weight overall
+
+```{r CDS zeros, fig.width = 8, fig.height = 8}
+par(mfrow = c(2,2))
+for(i in 1:ncol(num.cds)){
+    hist(num.cds[,i], breaks = 50, main = colnames(num.cds)[i], 
+    xlab = colnames(num.cds)[i])
+}
+```
+
+There are many mice that never display measurable symptoms
+and have cumulative disease scores of 0. This kind of floor
+effect causes problems with statistical tests that assume
+a normal distribution.
+
+If exclude.zeros is set to TRUE, these 0 values will be
+excluded from CDS mapping.
+
+In this analysis `r zero.text`.
+
+The plots below show the CDS distribution by strain.
+
+```{r cds, results = "asis", fig.width = 10, fig.height = 5}
+
+plot_qtl_by_strain <- function(scores, strain.labels, exclude.zeros = TRUE,
+    ymin = NULL, ymax = NULL, plot.label = ""){
+    
+    u_strain <- unique(strain.labels)
+    strain.idx <- lapply(u_strain, function(x) which(strain.labels == x))
+
+    if(exclude.zeros){
+        nonzero.idx <- which(scores != 0)
+    }else{
+        nonzero.idx <- 1:length(scores)
+    }
+    strain.cds <- lapply(strain.idx, function(x) scores[intersect(nonzero.idx, x)])
+    names(strain.cds) <- u_strain
+    strain.order <- order(sapply(strain.cds, mean))
+
+    if(is.null(ymax)){ymax = max(scores, na.rm = TRUE)}
+    if(is.null(ymin)){
+        ymin = min(scores, na.rm = TRUE)
+        #if(ymin > 0){ymin <- 0}
+    }
+
+    #quartz(width = 10, height = 5)
+    layout(matrix(c(1,2), ncol = 2), width = c(1, 0.5))
+    par(mar = c(4,4,4,0))
+    stripchart(strain.cds[strain.order], vertical = TRUE, pch = 16, 
+        col = "gray", method = "jitter", las = 2, ylim = c(ymin, ymax),
+        main = paste(plot.label), ylab = paste(plot.label, "values"))
+    a <- hist(unlist(strain.cds), plot = FALSE)
+    par(mar = c(4,0,4,2))
+    plot.new()
+    plot.window(xlim = c(0, max(a$counts)), ylim = c(ymin, ymax))
+    segments(x0 = rep(0, length(a$counts)), x1 = a$counts, y0 = a$mids, 
+        lwd = 10, col = "gray")
+    #text(x = a$counts+2, y = a$mids, labels = a$counts, adj = 0, cex = 0.7)
+    mtext("Individual Counts", side = 3)
+    axis(1)
+
+    invisible(strain.cds)
+}
+
+for(cd in 1:ncol(num.cds)){
+    cat("####", colnames(num.cds)[cd], "\n")
+    temp.vals <- plot_qtl_by_strain(scores = num.cds[,cd], 
+        strain.labels = factor.cds[,"Strain"], exclude.zeros = exclude.zeros,
+        ymax = max(num.cds[,1:3]), plot.label = colnames(num.cds)[cd]) # didn't like max() for all of them so using Chat for syntax reset it to max the former 3 columns
+    cat("\n\n")
+}
+```
+
+
+## Batch Effects
+
+The individuals were run in multiple batches, which can 
+cause systematic biases in the data. We need to correct
+any batch effects that we find before we map.
+
+The following heatmaps show how the different 
+strains and sexes were represented in different 
+batches. The males and females are shown separately.
+
+### CDS
+
+```{r CDS batch_assortment, fig.width = 5, fig.height = 7}
+batch.list <- vector(mode = "list", length = length(u_batch))
+for(b in 1:length(u_batch)){
+    batch.idx <- which(cds.covar[,b] == 1)
+    batch.mat <- matrix(0, nrow = length(eae.strains), ncol = 2)
+    rownames(batch.mat) <- eae.strains
+    batch.table <- table(data.frame(factor.cds[batch.idx,]))
+    batch.mat[match(rownames(batch.table), eae.strains),] <- batch.table
+    colnames(batch.mat) <- paste(colnames(cds.covar)[b], colnames(batch.table), sep = "_")
+    batch.list[[b]] <- batch.mat
+}
+all.batch.counts <- Reduce("cbind", batch.list)
+imageWithText(all.batch.counts, use.pheatmap.colors = TRUE, col.text.shift = -38.5,
+col.text.rotation = 45, col.text.adj = 0, cex = 0.7)
+```
+
+The following boxplots show the batch values for the B6 
+animals. These show that the batches had an increase in 
+CDS across the batches.
+
+```{r CDS_b6_batch, fig.width = 8, fig.height = 8, eval = FALSE}
+b6.idx <- which(factor.cds[,1] == "C57BL6")
+
+if(exclude.zeros){
+    nonzero.idx <- lapply(1:ncol(num.cds), function(x) which(num.cds[,x] != 0))
+}else{
+    nonzero.idx <- lapply(1:ncol(num.cds), function(x) 1:nrow(num.cds))
+}
+
+b6.batch.idx <- apply(cds.covar[,1:(ncol(cds.covar)-1)], 2, 
+    function(x) intersect(which(x == 1), b6.idx))
+
+par(mfrow = c(2,2))
+b6.by.batch <- vector(mode = "list", length = ncol(num.cds))
+names(b6.by.batch) <- colnames(num.cds)
+for(cd in 1:ncol(num.cds)){
+    #get batch values for this CDS
+    vals.by.batch <- lapply(1:length(b6.batch.idx), 
+        function(x) num.cds[intersect(b6.batch.idx[[x]], nonzero.idx[[cd]]),cd])
+    names(vals.by.batch) <- u_batch
+    b6.by.batch[[cd]] <- vals.by.batch
+    boxplot(b6.by.batch[[cd]], main = colnames(num.cds)[cd])    
+}
+
+```
+
+
+### Batch correction procedure
+
+The B6 batch correction procedure is as follows:
+
+1. Calculate the overall mean CDS for B6 mice 
+    across the entire experiment
+2. Calculate the mean CDS B6 mice in each batch.
+3. Adjust all mice in each batch based on the
+    difference in means in the B6. Subtract off 
+    the mean deviation, and divide by the standard
+    deviation.
+4. Male and female B6 mice do not have a sex 
+    difference in CDS, and adjusting by the 
+    two sexes separately could inadvertently 
+    introduce a sex effect into the other strains,
+    so we use overall means rather than sex-specific 
+    means.
+
+The batch correction procedure using batch as a covariate is as follows:
+
+1. Create a binary matrix indicating whether each individual
+    was run in each batch (1) or not (0).
+2. Regress this matrix out of the CDS matrix.
+
+
+#### Remove batch effects from CDS{.tabset .tabset-fade .tabset-pills}
+
+```{r adj_cds}
+#choose which phenotypes to batch 
+#correct using their indices.
+cds.idx <- c(1,2,3,4) 
+```
+
+Adjust for batch. We adjusted the following traits for batch effects:
+`r cat(colnames(num.cds)[cds.idx], sep = "\n")`
+
+```{r no_adj_cds}
+adj.cds <- num.cds 
+```
+
+```{r adj_batch_covar_cds}
+if(batch_as_covar){
+    adj.cds <- adjust(num.cds, cds.covar[,1:ncol(cds.covar)-1])
+}
+```
+
+```{r mean_sd_cds}
+
+if(b6_correction){
+    batch.mean <- sapply(b6.by.batch, function(x) sapply(x, mean))
+    batch.sd <- sapply(b6.by.batch, function(x) sapply(x, sd))
+    batch.sd[which(is.na(batch.sd))] <- 1
+
+    #for each batch
+    for(b in c(1:(ncol(cds.covar)-1))){
+        batch.idx <- which(cds.covar[,b] == 1)
+        for(j in cds.idx){ #only correct classical and global
+            if(exclude.zeros){
+                    nonzero.idx <- which(num.cds[,j] != 0)
+                }else{
+                    nonzero.idx <- 1:nrow(num.cds)
+                }
+            adj.idx <- intersect(batch.idx, nonzero.idx)
+            adj.cds[adj.idx,j] <- (num.cds[adj.idx,j] - batch.mean[b,j])/batch.sd[b,j]
+        }
+    }
+    
+}
+```
+
+
+
+
+### Age at D0 {.tabset .tabset-fade .tabset-pills}
+
+Another one of our covariates is Age.at.D0.
+
+The following boxplots show that age varies significantly 
+by batch.
+
+#### CDS
+
+```{r age_by_batch_cds}
+age <- cds.covar[,ncol(cds.covar)]
+age.by.batch <- lapply(1:(ncol(cds.covar)-1), function(x) age[which(cds.covar[,x] == 1)])
+p.val <- aov.by.list(age.by.batch)$"Pr(>F)"[1]
+
+boxplot(age.by.batch, main = paste("Age at D0 by batch\n", "p =", signif(p.val, 2)))
+stripchart(age.by.batch, vertical = TRUE, method = "jitter", pch = 16, 
+    col = "#756bb1", add = TRUE)
+```
+
+The following plots show the relationship between Age.at.D0
+and each CDS after adjusting for batch.
+
+```{r age_at_day0_cds, results = "asis", fig.width = 8, fig.height = 8}
+
+u_age <- unique(cds.covar[,"Age.at.D0"])
+age.idx <- lapply(u_age, function(x) which(cds.covar[,"Age.at.D0"] == x))
+cds.by.age <- lapply(age.idx, function(x) adj.cds[x,,drop=FALSE])
+
+par(mfrow = c(2,2))
+for(i in 1:4){
+    just.one <- lapply(cds.by.age, function(x) x[,i])
+    x.vals <- lapply(1:length(just.one), function(x) rep(u_age[x], length(just.one[[x]])))
+    x <- unlist(x.vals)
+    y <- unlist(just.one)
+    if(exclude.zeros){
+        nonzero.idx <- which(y != 0)
+    }else{
+        nonzero.idx <- 1:length(y)
+    }
+
+    plot.with.model(x[nonzero.idx], y[nonzero.idx], xlab = "Age at D0", 
+        ylab = colnames(num.cds)[i], main = colnames(num.cds)[i])
+}
+```
+
+
+```{r adjust_age_cds, eval = FALSE}
+#adjust for age
+for(i in 1:ncol(adj.cds)){
+    if(exclude.zeros){
+        nonzero.idx <- which(num.cds[,i] != 0)
+    }else{
+        nonzero.idx <- 1:nrow(num.cds)
+    }
+    adj.cds[nonzero.idx,i] <- adjust(adj.cds[nonzero.idx,i,drop=FALSE], 
+        cds.covar[nonzero.idx,"Age.at.D0",drop=FALSE])
+}
+```
+
+```{r write_adj_cds}
+#write out the results of whatever adjustments we have done
+write.table(adj.cds, file.path(results.dir, "Adj_CDS.csv"), sep = ",", quote = FALSE)
+```
+
+Rank Z normalize the CDS scores if this is specified.
+
+```{r no_norm_cds}
+norm.cds <- adj.cds
+colnames(norm.cds) <- gsub(".CDS", "", colnames(norm.cds)) #take off CDS in labels, to save room in plots
+```
+
+```{r norm_cds}
+if(rank_norm){
+    for(i in 1:ncol(norm.cds)){
+        if(exclude.zeros){
+            nonzero.idx <- which(num.cds[,i] != 0)
+        }else{
+            nonzero.idx <- 1:nrow(num.cds)
+        }
+        norm.cds[nonzero.idx,i] <- rankZ(adj.cds[nonzero.idx,i])
+    }
+}
+colnames(norm.cds) <- gsub(".CDS", "", colnames(norm.cds)) #take off CDS, to save room in plots
+
+#write out normzliaed values
+write.table(norm.cds, file.path(results.dir, "Norm_CDS.csv"), sep = ",", quote = FALSE)
+
+```
+
+## CC genotypes
+
+I downloaded the CC genotypes from the UNC website:
+http://csbio.unc.edu/CCstatus/CCGenomes/#genotypes
+
+I downloaded the Most Recent Common Ancestor file. 
+This has marker names from the mega muga. I downloaded the
+mega muga marker map from the Jackson Laboratory 
+[resource for CC/DO mice](https://www.jax.org/research-and-faculty/genetic-diversity-initiative/tools-data/diversity-outbred-reference-data)
+
+
+```{r MRCA_genotypes, warning = FALSE}
+cc.geno <- readRDS(here("Data", "MRCA10_modelprobs_trim.rds"))
+
+if(genotypes == "MRCA"){
+
+    marker.info.file <- here("Data", "mouse", "mm_uwisc_v1.csv")
+    marker.info <- read.csv(marker.info.file)
+
+    #convert the map and the genoprobs into a qtl2 object
+    cross_obj <- array2qtl2(cc.geno, marker.info, chr = c(1:19, "X"), chr.col = "chr", 
+        pos.col = "bp_mm10", crosstype = "risib8")
+
+    cc.genoprobs <- cross_obj$genoprobs
+    map <- cross_obj$map
+
+    K <- calc_kinship(cc.genoprobs, "loco")
+}
+```
+
+
+```{r sequenced_genotypes}
+
+if(genotypes == "sequenced"){
+    map.file <- here("Data", "map.RDS")
+    new.geno.file <- here("Data", "genoprobs.RDS")
+    k.file <- here("Data", "kinship_loco.RDS")
+
+    if(!file.exists(map.file)){
+        file <- paste0("https://raw.githubusercontent.com/rqtl/", "qtl2data/master/CC/cc.zip")
+        cc <- read_cross2(file)
+        map <- cc$pmap
+        saveRDS(map, map.file)
+        
+        cc.official <- rownames(cc$geno[[1]])
+        cc.alias <- sapply(strsplit(cc.official, "/"), function(x) x[1])
+        write.table(cbind(cc.official, cc.alias), here("Data", "CC_names.txt"), sep = "\t", 
+            quote = FALSE, row.names = FALSE, col.names = FALSE)
+        
+        cc.genoprobs <- calc_genoprob(cc, cores = cores)    
+        new.genoprobs <- cc.genoprobs
+
+        #add strains 83 and 84 to the genoprobs from the MRCA genotypes
+        new.strains <- c("CC083", "CC084")
+        new.strain.idx <- match(new.strains, rownames(cc.geno))
+        for(i in 1:length(cc.genoprobs)){
+            chr.markers <- dimnames(cc.genoprobs[[i]])[[3]]
+            common.markers <- intersect(chr.markers, dimnames(cc.geno)[[3]])
+            orig.idx <- match(common.markers, dimnames(cc.genoprobs[[i]])[[3]])
+            new.idx <- match(common.markers, dimnames(cc.geno)[[3]])
+            new.chr <- abind(cc.genoprobs[[i]][,,orig.idx], cc.geno[new.strain.idx,,new.idx], along = 1)
+            new.genoprobs[[i]] <- new.chr
+        }
+        saveRDS(new.genoprobs, new.geno.file)
+
+        #overwrite the original objecct
+        cc.genoprobs <- new.genoprobs
+
+        K <- calc_kinship(new.genoprobs, "loco")
+        saveRDS(K, k.file)
+    }else{
+        map <- readRDS(map.file)
+        cc.genoprobs <- readRDS(new.geno.file)
+        K <- readRDS(k.file)
+    }
+}
+```
+
+If specified, add genoptypes for 129, NOD, and B6, so we 
+can use them in mapping.
+
+```{r add_other_strains}
+if(add_founder_genotypes){
+    founder_fun <- function(strain.name){
+        founder.genotypes <- rep(0, length(strain.colors))
+        founder.idx <- which(names(strain.colors) == strain.name)
+        founder.genotypes[founder.idx] <- 1
+        return(founder.genotypes)
+    }
+
+    strain.129 <- founder_fun("129")
+    strain.b6 <- founder_fun("B6")
+    strain.nod <- founder_fun("NOD")
+
+    mapping.genoprobs  <- cc.genoprobs
+    for(i in 1:length(cc.genoprobs)){
+        ind.129 <- matrix(strain.129, nrow = ncol(cc.genoprobs[[i]]), 
+            ncol = dim(cc.genoprobs[[i]])[3])
+        ind.b6 <- matrix(strain.b6, nrow = ncol(cc.genoprobs[[i]]), 
+            ncol = dim(cc.genoprobs[[i]])[3])
+        ind.nod <- matrix(strain.nod, nrow = ncol(cc.genoprobs[[i]]), 
+            ncol = dim(cc.genoprobs[[i]])[3])
+        new.chr <- abind(cc.genoprobs[[i]], ind.129, ind.b6, ind.nod, along = 1)
+        rownames(new.chr)[tail(1:length(rownames(new.chr)), 3)] <- c("129", "C57BL6", "NOD")
+        mapping.genoprobs[[i]] <- new.chr
+    }
+
+    #recalculate K for the new genoprobs.
+    mapping.K <- calc_kinship(mapping.genoprobs, "loco")
+    mapping.strains <- eae.strains
+}else{
+    mapping.genoprobs <- cc.genoprobs
+    mapping.K <- K
+    mapping.strains <- eae.strains[grep("CC", eae.strains)]
+}
+```
+
+## Allele Frequencies {.tabset .tabset-fade .tabset-pills}
+
+The following plots show the frequencies of each founder 
+allele across each chromosome. Regions in which the allele
+frequencies are imbalanced may not be good for mapping. Similar to genotypes this should be the same for CDS.
+
+```{r allele_freq, results = "asis", fig.width = 8, fig.height = 4}
+allele_freq <- lapply(mapping.genoprobs, function(x) apply(x, 3, colMeans))
+for(ch in 1:length(allele_freq)){
+    cat("### Chr", names(map)[[ch]], "\n")
+    layout(matrix(c(1,2), nrow = 1), widths = c(1,0.3))
+    par(mar = c(4,4,4,0))
+    plot.new()
+    plot.window(xlim = c(0, max(map[[ch]])), ylim = c(0,0.4))
+    for(a in 1:nrow(allele_freq[[ch]])){
+        points(map[[ch]][dimnames(mapping.genoprobs[[ch]])[[3]]], 
+        allele_freq[[ch]][a,], col = strain.colors[a], type = "l", lwd = 2)
+    }
+    abline(h = 0)
+    axis(1)
+    axis(2)
+    mtext(paste("Chr", names(map)[[ch]]))
+    plot.new()
+    plot.window(xlim = c(0,1), ylim = c(0,1))
+    par(mar = c(4,0,4,0))
+    legend(x = 0, y = 1, lty = 1, col = strain.colors, legend = names(strain.colors), 
+        horiz = FALSE, bg = "white", lwd = 2, adj = 0)
+    cat("\n\n")
+}
+```
+
+
+## Original Processing
+
+### Normalized Scores {.tabset .tabset-fade .tabset-pills}
+
+The following plots show the distribution of each 
+disease score after adjustments and normalization.
+
+```{r norm_dist_CDS, fig.width = 10, fig.height = 5, results = "asis"}
+#ymin = min(norm.cds);ymax = max(norm.cds) #all on same axes
+ymin = NULL; ymax = NULL #all on independend axes
+for(cd in 1:ncol(norm.cds)){
+    cat("####", colnames(norm.cds)[cd], "\n")
+    plot_qtl_by_strain(scores = norm.cds[,cd], 
+        strain.labels = factor.cds[,"Strain"], exclude.zeros = exclude.zeros,
+        ymin = ymin, ymax = ymax, plot.label = colnames(num.cds)[cd])
+    cat("\n\n")
+}
+
+```
+
+
+
+
+
+### Overall Sex Effect for CDS
+
+```{r sex_diff_cds, fig.height = 8, fig.width = 8}
+#quartz(width = 8, height = 8)
+par(mfrow = c(2,2))
+for(i in 1:ncol(norm.cds)){
+    if(exclude.zeros){
+        nonzero.idx <- which(norm.cds[,i] != 0)
+    }else{
+        nonzero.idx <- 1:nrow(norm.cds)
+    }
+    model <- lm(norm.cds[nonzero.idx,i]~as.factor(factor.cds[nonzero.idx,"Sex"]))
+    f <- summary(model)$fstatistic
+    p <- pf(f[1],f[2],f[3],lower.tail=F)
+    boxplot(norm.cds[nonzero.idx,i]~as.factor(factor.cds[nonzero.idx,"Sex"]), 
+        ylab = colnames(norm.cds)[i],
+        main = paste(colnames(norm.cds)[i], "\np =", signif(p, 2)), xlab = "")
+}
+```
+
+
+
+### Trait Correlations
+
+The following plot shows that global CDS
+is dominated by classical disease.
+It also shows that CDS in classical 
+disease and AR are unrelated to each other. 
+Lastly, it shows the correlations between the
+average weight Loss and the CDS data which are negative. This makes sense because weight loss is associated with higher disease severity.
+
+```{r trait_cor_cds, fig.width = 8, fig.height = 12}
+trait.pairs <- pair.matrix(1:ncol(norm.cds))
+par(mfrow = c(3,2))
+for(i in 1:nrow(trait.pairs)){
+    trait1 <- trait.pairs[i,1]
+    trait2 <- trait.pairs[i,2]
+    if(exclude.zeros){
+        nonzero.idx <- intersect(which(norm.cds[,trait1] != 0), which(norm.cds[,trait2] != 0))
+    }else{
+        nonzero.idx <- 1:nrow(norm.cds)
+    }
+    plot.with.model(norm.cds[nonzero.idx,trait1], norm.cds[nonzero.idx,trait2],
+        xlab = colnames(norm.cds)[trait1], ylab = colnames(norm.cds)[trait2],
+        main = paste(colnames(norm.cds)[trait1], "vs.", colnames(norm.cds)[trait2]))
+}
+```
+
+
+### Map CDS with Individuals
+
+We mapped each CDS across the individual mice. 
+
+```{r methods}
+if(add_founder_genotypes){
+    methods.line <- "Both CC and founder strains were used for mapping."
+}else{
+    methods.line <- "We used only CC strains for mapping."
+}
+
+if(length(remove_strains) != 0){
+    remove.line <- paste("We excluded the following strains:", paste(remove_strains, collapse = ", "))
+}else{
+    remove.line <- "No CC strains were excluded."
+}
+
+
+```
+
+`r methods.line`
+`r remove.line`
+
+For the genoprobs and kinship matrices, we copied
+the entries for the individuals in each strain and
+used indices for row names.
+
+The LOD traces for each trait are shown below along 
+with plots for the FDR results. Significance thresholds
+from the permutations are also shown on the LOD traces.
+
+```{r expand_matrices_cds}
+
+#remove any strains not used in mapping
+mapping.strain.idx <- unlist(sapply(mapping.strains, function(x) grep(x, pheno.strains)))
+pheno.strains_cds <- pheno.strains[mapping.strain.idx]
+
+#make a unique ID for each mouse that contains its strain and sex
+u_id <- as.vector(apply(cds[mapping.strain.idx,c(1:2,5)], 1, function(x) paste(x, collapse = "_")))
+
+K.idx <- sapply(mapping.strains, function(x) grep(x, rownames(mapping.K[[1]])))
+K.num <- sapply(mapping.strains, function(x) length(which(pheno.strains_cds == x)))
+expanded.idx <- unlist(lapply(1:length(K.idx), function(x) rep(K.idx[x], K.num[x])))
+groups <- names(expanded.idx)
+
+exp.K <- lapply(1:length(mapping.K), function(x) mapping.K[[x]][expanded.idx,expanded.idx])
+names(exp.K) <- names(mapping.K)
+
+#create unique row and column names
+for(i in 1:length(exp.K)){
+    rownames(exp.K[[i]]) <- colnames(exp.K[[i]]) <- 1:length(u_id)
+}
+
+expanded.genoprobs <- mapping.genoprobs
+for(i in 1:length(expanded.genoprobs)){
+    expanded.genoprobs[[i]] <- mapping.genoprobs[[i]][expanded.idx,,]
+    rownames(expanded.genoprobs[[i]]) <- 1:length(u_id)
+}
+
+#align the phenotypes with the strains
+covar <- matrix(as.numeric(as.factor(cds[mapping.strain.idx,"Sex"])), ncol = 1)
+rownames(covar) <- 1:length(u_id)
+
+mapping.pheno <- norm.cds[mapping.strain.idx,]
+rownames(mapping.pheno) <- 1:length(u_id)
+
+mapping.factors <- factor.cds[mapping.strain.idx,]
+mapping.covar <- matrix(as.numeric(as.factor(mapping.factors[,"Sex"])), ncol = 1)
+rownames(mapping.covar) <- 1:length(u_id)
+
+```
+
+
+### Heritability
+
+The heritability of CDS is shown below.
+
+```{r herit_cds, fig.width = 7, fig.height = 5}
+overall.k.file <- here("Data", "kinship_overall.RDS")
+if(!file.exists(overall.k.file) || overwrite_previous){
+    overall.K <- calc_kinship(expanded.genoprobs, "overall")
+    saveRDS(overall.K, overall.k.file)
+}else{
+    overall.K <- readRDS(overall.k.file)
+}
+
+ind.herit <- rep(NA, ncol(num.cds))
+names(ind.herit) <- colnames(num.cds)
+for(i in 1:ncol(num.cds)){
+    nonzero.idx <- which(mapping.pheno[,i] != 0)
+    ind.herit[i] <- est_herit(mapping.pheno[nonzero.idx,i,drop=FALSE], overall.K)
+}
+
+barplot_with_num(round(ind.herit, 2), ylab = "Heritability", xlab = "", 
+    ylim = c(0, 0.4), text.shift = 0.09, main = "Trait Heritability Estimates")
+```
+
+
+```{r mapping_fun}
+#We have run into problems with extremely small variance
+#in genotype probabilities leading to large LOD scores.
+#round.digs attempts to solve this by rounding all 
+#genotype probabilities to the specified number of 
+#significant figures. All CC lines should be either 1 or
+#0 at every locus, so 2 digits should be sufficient to 
+#get any errant heterozygotes, but also squash out very
+#small variations
+map_pheno <- function(map.geno, map.pheno, map.K, addcovar = NULL,
+    intcovar = NULL, groups = NULL, exclude.zeros = TRUE, 
+    round.digs = 2,
+    results.file = file.path(results.dir, "scan1_results.RDS")){
+
+    if(!file.exists(results.file) || overwrite_previous){
+
+        #round the genotypes so low-variance markers don't lead
+        #to large QTL LOD scores
+        rounded.geno <- map.geno
+        for(chr in 1:length(rounded.geno)){
+            rounded.geno[[chr]] <- round(map.geno[[chr]], round.digs)
+        }
+
+        pheno.scans <- vector(mode = "list", length = ncol(map.pheno))
+        names(pheno.scans) <- colnames(map.pheno)
+        for(ph in 1:ncol(map.pheno)){
+            if(exclude.zeros){
+                nonzero.idx <- which(map.pheno[,ph] != 0)
+            }else{
+                nonzero.idx <- 1:nrow(map.pheno)
+            }
+
+            pheno.scans[[ph]] <- scan1(rounded.geno, map.pheno[nonzero.idx,ph], 
+                addcovar = addcovar, intcovar = intcovar, kinship = map.K)
+            #plot(pheno.scans[[ph]], map = map)
+        }
+        saveRDS(pheno.scans, results.file)
+    }else{
+        pheno.scans <- readRDS(results.file)
+    }
+    return(pheno.scans)
+}
+
+
+perm_scans <- function(map.geno, map.pheno, map.k, scan1.results, 
+    addcovar = NULL, intcovar = NULL, groups = NULL, nperm = nperm, 
+    max.exp.lod = 20, n.founders = 8, exclude.zeros = TRUE, 
+    results.file = file.path(results.dir, "perm.RDS"), round.digs = 2){
+
+    #permutations for Matt's FDR method (see https://github.com/j-matthew-mahoney/cdf-fdrci.git)
+    #right now this does one phenotype at a time, but we can change that later.
+    perm.data <- vector(mode = "list", length = ncol(map.pheno))
+    nind = nrow(map.pheno)
+    #bin possible LOD scores
+    breaks = lod2p(seq(max.exp.lod, 0, -0.01), nind = nind, k = n.founders)
+
+    #round the genotypes to get rid of very small variances that
+    #lead to large QTL LOD scores
+    rounded.geno <- map.geno
+    for(chr in 1:length(rounded.geno)){
+        rounded.geno[[chr]] <- round(map.geno[[chr]], round.digs)
+    }
+
+    if(!file.exists(results.file)){
+        for(ph in 1:ncol(map.pheno)){
+            if(exclude.zeros){
+                nonzero.idx <- which(map.pheno[,ph] != 0)
+            }else{
+                nonzero.idx <- 1:nrow(map.pheno)
+            }
+            if(!is.null(groups)){
+                null_stats = scan1_groupperm_stats(rounded.geno, 
+                    pheno = map.pheno[nonzero.idx,ph,drop=FALSE], 
+                    groups = groups[nonzero.idx],
+                    kinship = map.k, nperm = nperm, breaks = breaks, 
+                    addcovar = addcovar, intcovar = intcovar,
+                    scan1_out = scan1.results[[ph]][,1,drop=FALSE], cores = cores)
+            }else{
+                null_stats = scan1perm_stats(rounded.geno, 
+                    pheno = map.pheno[nonzero.idx,ph,drop=FALSE], 
+                    kinship = map.k, nperm = nperm, breaks = breaks,
+                    addcovar = addcovar, intcovar = intcovar,
+                    scan1_out = scan1.results[[ph]][,1,drop=FALSE], cores = cores)
+            }
+            perm.data[[ph]] <- null_stats
+        }
+        saveRDS(perm.data, results.file)
+    }else{
+        perm.data <- readRDS(results.file)
+    }
+    return(perm.data)
+}
+
+#plots LOD traces with significance thresholds and returns a matrix
+#with traits in rows and the different significance thresholds for
+#LOD scores in columns corresponding to both standard and FDR-adjusted 
+#LOD scores.
+plot_fdr_fun <- function(scan.results, perm.results, tab.level = "###", maxy = NULL){
+
+    fdr_summaries <- matrix(NA, nrow = length(scan.results), ncol = 5)
+    rownames(fdr_summaries) <- names(scan.results)
+    for(ph in 1:length(scan.results)){
+        cat(tab.level, names(scan.results)[ph], "\n")
+        summary_thresholds = fdr_summarize(null_stats = perm.results[[ph]], 
+            fdr_cl = 0.95, geno_sig = alpha, fdr_thresh = c(0.1, 0.2, 0.4), 
+            plot = FALSE, quartz = FALSE)
+
+        finite.thresh <- which(is.finite(summary_thresholds))
+
+        if(is.null(maxy)){
+            maxy <- max(c(scan.results[[ph]][,1], 
+                summary_thresholds[finite.thresh], na.rm = TRUE))*1.1
+        }
+        par(mar = c(4, 4, 4, 2))
+        plot(scan.results[[ph]], map = map, main = names(scan.results)[ph], 
+            ylim = c(0, maxy))
+        abline(h = summary_thresholds, lty = 1:length(summary_thresholds))
+        plot.dim <- par("usr")
+        par(xpd = TRUE)
+        #text(x = plot.dim[2], y = summary_thresholds[finite.thresh], 
+        #    labels = names(summary_thresholds)[finite.thresh], cex = 0.5, adj = 0)
+        text(x = plot.dim[2]*1.01, y = summary_thresholds[finite.thresh], 
+            labels = alpha, cex = 0.5, adj = 0)
+
+        #text(x = plot.dim[1], y = summary_thresholds[finite.thresh],
+        #    labels = summary_thresholds[finite.thresh], cex = 0.7, adj = 1)
+        par(xpd = FALSE)
+        fdr_summaries[ph,] <- summary_thresholds
+        cat("\n\n")
+    }
+    colnames(fdr_summaries) <- names(summary_thresholds)
+    invisible(fdr_summaries)
+}
+
+#This function is similar to above, but uses permutation results
+#from qtl2's scan1perm, rather than the fdr scan.
+plot_pval_fun <- function(scan.results, perm.results, tab.level = "###"){
+
+    sig_summaries <- t(summary(perm.results, alpha = alpha))
+    finite.thresh <- which(is.finite(sig_summaries))
+    #fdr_summaries <- matrix(NA, nrow = length(scan.results), ncol = length(alpha))
+    #rownames(fdr_summaries) <- names(scan.results)
+    #colnames(fdr_summaries) <- paste0("FDR ", alpha*100, "%")
+
+    for(ph in 1:length(scan.results)){
+        cat(tab.level, names(scan.results)[ph], "\n")
+
+        trait.p <- lod2p(scan.results[[ph]][,1], nind = attr(scan.results[[ph]], "sample_size"), k = 8)
+        trait.fdr <- p.adjust(trait.p, "fdr")
+        #plot(scan.results[[ph]][,1], trait.fdr, ylim = c(0,1))
+        #abline(h = alpha)
+        
+        fdr.idx <- lapply(alpha, function(x) which(round(trait.fdr, 2) == x))
+        fdr.thresh <- unlist(lapply(fdr.idx, function(x) if(length(x) > 0){scan.results[[ph]][x]}else{NA}))
+        #fdr_summaries[ph,] <- fdr.thresh
+
+        maxy <- max(c(scan.results[[ph]][,1], 
+            sig_summaries[ph,], na.rm = TRUE))*1.1
+        par(mar = c(4, 4, 4, 8))
+        plot(scan.results[[ph]], map = map, main = names(scan.results)[ph], 
+            ylim = c(0, maxy))
+        abline(h = sig_summaries[ph,], lty = c(1,2))
+        #abline(h = fdr_summaries[ph,])
+        plot.dim <- par("usr")
+        par(xpd = TRUE)
+        text(x = plot.dim[2]*1.005, y = sig_summaries[ph,], 
+            labels = colnames(sig_summaries), cex = 0.7, adj = 0)
+        par(xpd = FALSE)
+        cat("\n\n")
+    }
+    #sig_summaries <- cbind(sig_summaries, fdr_summaries)
+    sig_summaries <- cbind(sig_summaries)
+    invisible(sig_summaries)
+}
+
+select_threshold <- function(scan.results, fdr_summaries){
+    for(ph in 1:length(scan.results)){
+        finite.thresh <- fdr_summaries[ph,which(is.finite(fdr_summaries[ph,]))]
+        peak.tables <- lapply()
+    }
+}
+
+allele_coef <- function(map.geno, map.pheno, map.k, addcovar = NULL,
+    intcovar = NULL, scan.results, lod.threshold, exclude.zeros, 
+    chr.lod.file, chr.coef.file, round.digs = 2){
+
+    peak.table <- lapply(1:length(scan.results), 
+        function(x) find_peaks(scan.results[[x]], map = map, 
+        threshold = lod.threshold[x]))
+
+    #round genotypes to reduce risk of low-variance alleles
+    #leading to large QTL LOD scores
+    rounded.geno <- map.geno
+    for(chr in 1:length(rounded.geno)){
+        rounded.geno[[chr]] <- round(map.geno[[chr]], round.digs)
+    }
+
+    if(!file.exists(chr.lod.file) || overwrite_previous){
+        chr.lod <- chr.coef <- vector(mode = "list", length = nrow(Reduce("rbind", peak.table)))
+        idx = 1
+        for(ph in 1:length(peak.table)){
+            if(nrow(peak.table[[ph]]) != 0){
+                for(p in 1:nrow(peak.table[[ph]])){
+                    chr <- peak.table[[ph]][p,"chr"]
+                    peak.loc <- peak.table[[ph]][p,"pos"]
+                    trait = names(scan.results)[ph]
+                    chr.locale <- which(names(map.geno) == chr)
+
+                    if(exclude.zeros){
+                        nonzero.idx <- which(map.pheno[,ph] != 0)
+                    }else{
+                        nonzero.idx <- 1:nrow(map.pheno)
+                    }
+
+                    chr.scan <- scan1(rounded.geno[,chr], 
+                        map.pheno[nonzero.idx,ph,drop=FALSE], 
+                        kinship = map.k[[chr.locale]], addcovar = addcovar,
+                        intcovar = intcovar)
+                    chr.lod[[idx]] <- chr.scan
+                    #plot(chr.scan, map = map);abline(v = peak.loc)
+
+                    effects.scan <- scan1blup(rounded.geno[,chr], 
+                        map.pheno[nonzero.idx,ph,drop=FALSE], 
+                        kinship = map.k[[chr.locale]], addcovar = addcovar)
+                    chr.coef[[idx]] <- effects.scan
+                    #plot_coefCC(effects.scan, map = map);abline(v = peak.loc)
+                    idx = idx + 1 #increment regardless of whether there is a peak here
+                }
+                
+            }
+        }
+        saveRDS(chr.lod, chr.lod.file)
+        saveRDS(chr.coef, chr.coef.file)
+    }else{
+        chr.lod <- readRDS(chr.lod.file)
+        chr.coef <- readRDS(chr.coef.file)
+    }
+    result <- list("peak.table" = peak.table, "LOD" = chr.lod, "Coef" = chr.coef)
+    return(result)
+}
+
+plot_coef_scans <- function(coef.results, map.geno, map.pheno, fdr_results = NULL,
+    tab.level = "###", sig_lines = c("Genome-wide", "FDR")){
+    
+    if(!is.null(fdr_results)){
+        sig_lines = sig_lines[1]
+        line.idx <- grep(sig_lines, colnames(fdr_results))
+    }
+
+    peak.table <- coef.results$peak.table
+    chr.lod <- coef.results$LOD
+    chr.coef <- coef.results$Coef
+
+    idx <- 1
+    for(ph in 1:length(peak.table)){
+        if(nrow(peak.table[[ph]]) != 0){
+            for(p in 1:nrow(peak.table[[ph]])){
+                par(mfrow = c(2,1))
+                chr <- peak.table[[ph]][p,"chr"]
+                trait <- colnames(map.pheno)[ph]
+                peak.loc <- peak.table[[ph]][p,"pos"]
+                chr.locale <- which(names(map.geno) == chr)
+                
+                cat(tab.level, trait, "Chr", chr, "\n")
+
+                if(!is.null(fdr_results)){
+                    ymax <- max(c(chr.lod[[idx]], fdr_results[ph,line.idx]))
+                }else{
+                    ymax <- max(chr.lod[[idx]])
+                }
+                plot(chr.lod[[idx]], map = map, main = paste(trait, "Chr", chr), 
+                    ylim = c(0, ymax*1.05))
+                if(!is.null(fdr_results)){
+                    abline(h = fdr_results[ph,line.idx], lty = ph)
+                
+                    plot.dim <- par("usr")
+                    par(xpd = TRUE)
+                    text(x = plot.dim[2], y = fdr_results[ph,line.idx], 
+                        labels = gsub(paste0(sig_lines, " "), "", colnames(fdr_results)[line.idx]), 
+                        cex = 0.5, adj = 0)
+                }
+                par(xpd = FALSE)
+
+
+                plot_coefCC(chr.coef[[idx]], map = map, main = paste(trait, "Chr", chr),
+                    col = strain.colors)
+                abline(v = peak.loc, lwd = 2)
+
+                idx = idx + 1
+                cat("\n\n")
+            }
+        }
+    }
+}
+
+```
+
+```{r map_cds, warning = FALSE}
+
+cds.scans <- map_pheno(expanded.genoprobs, mapping.pheno, exp.K, 
+    addcovar = covar, exclude.zeros = exclude.zeros,results.file = file.path(results.dir, "scan1_results_cds.RDS"))
+
+
+
+if(run_permutations){
+    #perm_strata <- names(expanded.idx)
+    #names(perm_strata) <- rownames(mapping.pheno)
+    #cds.perm <- scan1perm(expanded.genoprobs, mapping.pheno, kinship = exp.K, 
+    #    addcovar = covar, perm_strata = perm_strata, n_perm = nperm, cores = detectCores()-1)
+
+    #cds.perm <- scan1perm(expanded.genoprobs, mapping.pheno, kinship = exp.K, 
+    #    addcovar = covar, n_perm = nperm, cores = detectCores()-1)
+
+    cds.perm <- perm_scans(expanded.genoprobs, mapping.pheno, exp.K,
+        cds.scans, addcovar = covar, groups = names(expanded.idx), 
+        exclude.zeros = exclude.zeros, nperm = nperm, 
+        results.file = file.path(results.dir, "scan1perm_results_cds_perm_scans.RDS"))
+}
+
+
+
+```
+
+
+
+
+### CDS by individual LOD traces {.tabset .tabset-fade .tabset-pills}
+
+```{r plot_cds_scans, fig.width = 10, fig.height = 4, warning = FALSE, results = "asis"}
+#plot the scans, and FDR results
+if(run_permutations){
+    #pdf("~/Desktop/test.pdf")
+    fdr_summaries_cds <- plot_fdr_fun(scan.results = cds.scans, perm.results = cds.perm, 
+        tab.level = "####", maxy = NULL)
+    #sig_summaries_cds <- plot_pval_fun(scan.results = cds.scans, perm.results = cds.perm, tab.level = "####")
+    #dev.off()
+}else{
+    for(i in 1:length(cds.scans)){
+        cat("####", names(cds.scans)[i], "\n")
+        plot(cds.scans[[i]], map = map)
+        cat("\n\n")
+    }
+}
+```
+
+
+### CDS by individual allele effects {.tabset .tabset-fade .tabset-pills}
+
+The following plot shows the allele effects for chromosomes 2, 14, 15, 17, and 19 for Global CDS as well as Average Weight Loss. There are two plots per QTL per chromosome. One 
+of the full chromosome, and another that captures as much 
+of the QTL as possible without showing the weirdness.
+
+The chromosomes that were selected for analysis are based on peaks identified in either Global CDS and/or Average Weight Loss, specially from the Log Transformation with Batch Correlation processing scheme for Average Weight Loss. Thus, this is repeated for Average Weight Loss under that processing scheme. 
+
+Chromosomal Peaks:
+
+- Chr 2, 15, and 17  = Average Weight Loss Peak from Batch, Log Transformation processing
+
+- Chr 19 = Potential shared peak for both
+
+- Chr 14 = Global CDS Peak Originally found using Batch, Rank Z
+
+
+
+```{r global_detail, fig.height = 8, fig.width = 8}
+
+#round genotypes to squash out the wild associations we 
+#get with teeny tiny probabilities
+rounded.geno <- expanded.genoprobs
+for(i in 1:length(rounded.geno)){
+    rounded.geno[[i]] <- round(rounded.geno[[i]], 2)
+}
+
+# chr = 14
+# global.lod <- scan1(rounded.geno[,chr], mapping.pheno[,"Global"], exp.K[[chr]],
+#     addcovar = covar)
+# global.coef <- scan1coef(rounded.geno[,chr], mapping.pheno[,"Global"], exp.K[[chr]],
+#     addcovar = covar)
+# 
+# plot_coefCC(global.coef, map = map, scan1_output = global.lod,
+#     ylim = c(-2, 2), col = strain.colors, main = "Global CDS full Chr 14",
+#     top_panel_prop = 0.5)
+# 
+# 
+# plot_coefCC(global.coef, map = map, scan1_output = global.lod,
+#     ylim = c(-2, 2), col = strain.colors, xlim = c(95, 125),
+#     main = "Global CDS Chr 14 QTL Window", top_panel_prop = 0.5)
+
+chr_list = c(2,14,15,17,19)
+interval_list = list(c(5, 170), c(95,125), c(55, 74), c(3, 72), c(44, 57))
+
+for(i in 1:length(chr_list)){
+
+
+# For Global CDS
+
+global.lod <- scan1(rounded.geno[,chr_list[i]], mapping.pheno[,"Global"], exp.K[[chr_list[i]]],
+    addcovar = covar)
+global.coef <- scan1coef(rounded.geno[,chr_list[i]], mapping.pheno[,"Global"], exp.K[[chr_list[i]]],
+    addcovar = covar)
+
+plot_coefCC(global.coef, map = map, scan1_output = global.lod,
+    ylim = c(-2, 2), col = strain.colors, main = paste0("Global CDS full Chr ", chr_list[i]),
+    top_panel_prop = 0.5)
+
+
+plot_coefCC(global.coef, map = map, scan1_output = global.lod,
+    ylim = c(-2, 2), col = strain.colors, xlim = interval_list[[i]],
+    main = paste0("Global CDS Chr ", chr_list[i],  " QTL Window"), top_panel_prop = 0.5)
+
+# for Average Weight Loss
+av_weight_Loss.lod <- scan1(rounded.geno[,chr_list[i]], mapping.pheno[,"Avg.Weight.Loss"], exp.K[[chr_list[i]]],
+    addcovar = covar)
+av_weight_Loss.coef <- scan1coef(rounded.geno[,chr_list[i]], mapping.pheno[,"Avg.Weight.Loss"], exp.K[[chr_list[i]]],
+    addcovar = covar)
+
+plot_coefCC(av_weight_Loss.coef, map = map, scan1_output = av_weight_Loss.lod,
+    ylim = c(-2, 2), col = strain.colors, main = paste0("Avg Weight Loss full Chr ", chr_list[i]),
+    top_panel_prop = 0.5)
+
+
+plot_coefCC(av_weight_Loss.coef, map = map, scan1_output = av_weight_Loss.lod,
+    ylim = c(-2, 2), col = strain.colors, xlim = interval_list[[i]],
+    main = paste0("Avg Weight Loss Chr ", chr_list[i],  " QTL Window"), top_panel_prop = 0.5)
+
+}
+
+
+```
+
+
+
+```{r scan_coef_cds, fig.width = 7, fig.height = 7, results = "asis", eval = FALSE}
+cds.coef <- allele_coef(map.geno = expanded.genoprobs, 
+    map.pheno = mapping.pheno, map.k = exp.K, addcovar = mapping.covar,
+    scan.results = cds.scans,
+    lod.threshold = allele.thresh, exclude.zeros = exclude.zeros, 
+    chr.lod.file = file.path(results.dir, "Chr.LOD.cds.RDS"), 
+    chr.coef.file = file.path(results.dir, "Chr.Coef.cds.RDS"))
+
+#pdf("~/Desktop/test.pdf", width = 7, height = 7)
+if(run_permutations){
+    plot_coef_scans(coef.results = cds.coef, 
+        map.geno = expanded.genoprobs, map.pheno = mapping.pheno, 
+        fdr_results = fdr_summaries_cds, tab.level = "####",
+        sig_lines = "Genome-wide")
+}else{
+    plot_coef_scans(coef.results = cds.coef, 
+        map.geno = expanded.genoprobs, map.pheno = mapping.pheno, 
+        fdr_results = NULL, tab.level = "####",
+        sig_lines = "Genome-wide")
+}
+
+#dev.off()
+```
+
+
+### LOD intervals {.tabset .tabset-fade .tabset-pills} 
+
+The following tables show LOD peak intervals for the top 3 peaks from 
+each trait.
+
+#### CDS
+
+```{r lod_peaks_cds, results = "asis"}
+top.n <- 5
+for(ph in 1:length(cds.scans)){
+    cat("#####", names(cds.scans)[ph], "\n")
+    peak.table <- find_peaks(cds.scans[[ph]], map = map, prob = 0.95)
+    lod.order <- order(peak.table[,"lod"], decreasing = TRUE)
+    top.peaks <- peak.table[lod.order[1:top.n],3:ncol(peak.table)]
+    rownames(top.peaks) <- NULL
+    print(kable(top.peaks))
+    cat("Thresholds:\n")
+    print(kable(fdr_summaries_cds[ph,,drop=FALSE]))
+    cat("\n\n")
+}
+```
+
+
+
+## Log Transformation
+
+All of the steps taken above to yield LOD traces included doing a rank Z tranformation and batch as a covariate. However, these data processing techniques were chosen specifically for CDS before adding the weight Loss data and may impose unknown affects that Loss the story of our other data. Now we will repeat an abbreviated version of the steps run above while changing the following parameters:
+
+* Correction/batch: none, batch, B6
+
+* Transformation: none, rank z, log
+
+
+### Batch, Log Transformation Set Up
+
+```{r parameters_and_start_up_batch_log_trans}
+
+# preparing to make new files for the new data processing method
+file_added_name = 'batch_log_trans' 
+
+# Using the flexibility from the previous code, these parameters will be updated
+final_param = TRUE
+
+if(final_param){
+    b6_correction <- FALSE
+    batch_as_covar <- TRUE
+    rank_norm <- FALSE
+    log_trans <- TRUE
+}
+#===============================================================
+
+if(is.na(b6_correction) || length(b6_correction) == 0){
+b6_correction = FALSE; batch_as_covar = FALSE; rank_norm = FALSE
+}
+
+if(b6_correction && batch_as_covar){stop("Set either b6_correction or batch_as_covar to TRUE, not both.")}
+
+alpha <- c(0.05, 0.2)
+
+overwrite_previous <- FALSE # make this true whenever you add new data that you want fully analyzed; this WILL take longer and may not work on a low powered machine
+add_founder_genotypes <- FALSE
+
+#strains identified by remove_strains are excluded from all
+#manipulations including normalization and batch corrections.
+#justficiations are as follows:
+#CC027 - all but 2 were homozygous for the wrong genotype at the H2 locus
+#NOD and 129 - are not used for mapping, and were not included in all
+#batches, so we cannot use them for normalization
+#remove_strains <- NULL
+remove_strains <- c("CC027", "NOD", "129")
+#remove_strains <- c("CC051", "CC059") #closely related
+#remove_strains <- c("CC051") #pick one of them to keep
+
+cc.color.scheme = "original"
+#cc.color.scheme = "new"
+
+#for calculations
+exclude.zeros = FALSE #if true, we exclude animals with a CDS of 0
+disease.thresh = 0 #maximum disease score considered disease-free
+
+nperm = 1000
+
+if(nperm > 0){
+    run_permutations <- TRUE
+}else{
+    run_permutations <- FALSE
+}
+
+if(add_founder_genotypes){
+    founders.included = "yes"
+}else{
+    founders.included = "no"
+}
+
+if(length(remove_strains) > 0){
+    strains.removed <- paste(remove_strains, collapse = ", ")
+}else{
+    strains.removed = "none"
+}
+
+if(!exclude.zeros){
+    zero.text <- "Zeros are included in CDS"
+    zero.treatment <- "included with"
+}else{
+    zero.text <- paste("Animals with scores of", disease.thresh, "and below are excluded from CDS.")
+    zero.treatment <- "excluded from"
+}
+
+if(b6_correction){
+    correction.text <- "Batch corrections were made using B6 CDS."
+    correction.label <- "B6-batch"
+}
+if(batch_as_covar){
+    correction.text <- "Batch corrections were done using batch as a covariate."
+    correction.label <- "covar-batch"
+}
+if(!b6_correction && !batch_as_covar){
+    correction.text <- "No batch corrections were done."
+    correction.label <- "no-batch"
+}
+
+if(rank_norm){
+    norm.text <- "Rank Z normalization was performed."
+    norm.label <- "rank-norm"
+}else if (log_trans){
+    norm.text <- "Log Transformation was performed"
+    norm.label <- 'log-trans'
+}else{
+    norm.text <- "Rank Z normalization was not performed."
+    norm.label <- "no-norm"
+}
+
+file.label <- paste(correction.label, norm.label, genotypes, sep = "_")
+```
+
+The parameters for this run are as follows:
+
+* Genotypes used: `r genotypes`
+
+* Founders included: `r founders.included`
+
+* CC Strains removed: `r strains.removed`
+
+* Treatment of zeros: `r zero.text`
+
+* Batch correction: `r correction.text`
+
+* Normalization: `r norm.text`
+
+```{r reload_data_batch_log_trans}
+if(cc.color.scheme == "original"){
+    strain.colors <- CCorigcolors
+}else{
+    strain.colors <- CCcolors
+}
+
+cds <- read.csv(here("Data", paste0("CDS_", cds.file.date, ".csv")), strip.white = TRUE)
+
+
+#take out any slashes in strain names
+cds[,"Strain"]  <- gsub("/", "", cds[,"Strain"], fixed = TRUE)
+
+```
+
+```{r remove_strains_batch_log_trans}
+#remove any empty rows that were inserted to visually separate
+#the founders from the rest of the strains
+cds.data.idx <- which(!is.na(cds[,"ID"]))
+cds <- cds[cds.data.idx,]
+
+
+#remove specified strains from cds
+if(length(remove_strains) != 0){
+    remove.cds <- unlist(sapply(remove_strains, function(x) which(cds[,"Strain"] == x)))
+    cds <- cds[-remove.cds,]
+}
+
+
+```
+
+
+```{r batches_batch_log_trans}
+## CDS
+num.cds <- as.matrix(sapply(cds[,c( "Global.CDS", "Avg.Weight.Change","Avg.Weight.Loss", "Weight.D0")], as.numeric)) #had to change this with Chat to make the values numeric
+rownames(num.cds) <- cds[,"ID"]
+#set all scores equal to or lower than the disease threshold
+#to zero
+if(exclude.zeros){
+    num.cds[which(num.cds <= disease.thresh)] <- 0
+}
+
+factor.cds <- as.matrix(cds[,c("Strain", "Sex")])
+u_batch <- unique(cds[,"EXP"])
+
+#remove animals in batch 170 - these were validation, not part of the original experiment
+to.remove = "X170"
+keep.batch <- which(u_batch != "X170")
+u_batch <- u_batch[keep.batch]
+
+keep.idx <- which(cds[,"EXP"] != "X170")
+cds <- cds[keep.idx,]
+num.cds <- num.cds[keep.idx,]
+factor.cds <- factor.cds[keep.idx,]
+
+batch.mat <- matrix(0, nrow = nrow(cds), ncol = length(u_batch))
+colnames(batch.mat) <- u_batch
+for(b in 1:ncol(batch.mat)){
+    batch.mat[which(cds[,"EXP"] == u_batch[b]),b] <- 1
+}
+cds.covar <- as.matrix(cbind(batch.mat, cds[,"Age.at.D0",drop=FALSE]))
+
+pheno.strains <- cds[,"Strain"]
+eae.strains <- unique(pheno.strains)
+
+
+```
+
+
+```{r adj_cds_batch_log_trans}
+#choose which phenotypes to batch
+#correct using their indices.
+cds.idx <- c(1,2,3,4)
+adj.cds <- num.cds
+
+if(batch_as_covar){
+    adj.cds <- adjust(num.cds, cds.covar[,1:ncol(cds.covar)-1])
+}
+
+ymin = NULL; ymax = NULL #all on independend axes
+for(cd in 1:ncol(norm.cds)){
+    cat("####", colnames(norm.cds)[cd], "\n")
+    plot_qtl_by_strain(scores = norm.cds[,cd], 
+        strain.labels = factor.cds[,"Strain"], exclude.zeros = exclude.zeros,
+        ymin = ymin, ymax = ymax, plot.label = colnames(num.cds)[cd])
+    cat("\n\n")
+}
+```
+
+
+
+```{r adjust_age_cds_batch_log_trans, eval = FALSE}
+#adjust for age
+for(i in 1:ncol(adj.cds)){
+    if(exclude.zeros){
+        nonzero.idx <- which(num.cds[,i] != 0)
+    }else{
+        nonzero.idx <- 1:nrow(num.cds)
+    }
+    adj.cds[nonzero.idx,i] <- adjust(adj.cds[nonzero.idx,i,drop=FALSE],
+        cds.covar[nonzero.idx,"Age.at.D0",drop=FALSE])
+}
+
+#write out the results of whatever adjustments we have done
+write.table(adj.cds, file.path(results.dir, paste0("Adj_CDS", file_added_name, ".csv")), sep = ",", quote = FALSE)
+
+ymin = NULL; ymax = NULL #all on independend axes
+for(cd in 1:ncol(norm.cds)){
+    cat("####", colnames(norm.cds)[cd], "\n")
+    plot_qtl_by_strain(scores = norm.cds[,cd], 
+        strain.labels = factor.cds[,"Strain"], exclude.zeros = exclude.zeros,
+        ymin = ymin, ymax = ymax, plot.label = colnames(num.cds)[cd])
+    cat("\n\n")
+}
+```
+
+```{r no_norm_cds_batch_log_trans}
+norm.cds <- adj.cds
+colnames(norm.cds) <- gsub(".CDS", "", colnames(norm.cds)) #take off CDS in labels, to save room in plots
+
+if(rank_norm){
+    for(i in 1:ncol(norm.cds)){
+        if(exclude.zeros){
+            nonzero.idx <- which(num.cds[,i] != 0)
+        }else{
+            nonzero.idx <- 1:nrow(num.cds)
+        }
+        norm.cds[nonzero.idx,i] <- rankZ(adj.cds[nonzero.idx,i])
+    }
+}
+
+if(log_trans){
+    for(i in 1:ncol(norm.cds)){
+        if(exclude.zeros){
+            nonzero.idx <- which(num.cds[,i] != 0)
+        }else{
+            nonzero.idx <- 1:nrow(num.cds)
+        }
+      if (min(adj.cds[,i])<0){
+        adj.cds <- adj.cds - min(adj.cds[,i])
+      }  
+        norm.cds[nonzero.idx,i] <- log(adj.cds[nonzero.idx,i]+1)
+    }
+}
+colnames(norm.cds) <- gsub(".CDS", "", colnames(norm.cds)) #take off CDS, to save room in plots
+
+#write out normzliaed values
+write.table(norm.cds, file.path(results.dir, paste0("Norm_CDS",file_added_name,".csv")), sep = ",", quote = FALSE)
+
+```
+
+
+
+```{r methods_batch_log_trans}
+if(add_founder_genotypes){
+    methods.line <- "Both CC and founder strains were used for mapping."
+}else{
+    methods.line <- "We used only CC strains for mapping."
+}
+
+if(length(remove_strains) != 0){
+    remove.line <- paste("We excluded the following strains:", paste(remove_strains, collapse = ", "))
+}else{
+    remove.line <- "No CC strains were excluded."
+}
+
+
+```
+
+`r methods.line`
+`r remove.line`
+
+### Normalized Scores {.tabset .tabset-fade .tabset-pills}
+
+This is post processing
+```{r norm_dist_CDS_log_trans, fig.width = 10, fig.height = 5, results = "asis"}
+#ymin = min(norm.cds);ymax = max(norm.cds) #all on same axes
+ymin = NULL; ymax = NULL #all on independend axes
+for(cd in 1:ncol(norm.cds)){
+    cat("####", colnames(norm.cds)[cd], "\n")
+    plot_qtl_by_strain(scores = norm.cds[,cd], 
+        strain.labels = factor.cds[,"Strain"], exclude.zeros = exclude.zeros,
+        ymin = ymin, ymax = ymax, plot.label = colnames(num.cds)[cd])
+    cat("\n\n")
+}
+
+```
+
+### Overall Sex Effect
+
+```{r sex_diff_cds_batch_log_trans}
+#quartz(width = 8, height = 8)
+par(mfrow = c(2,2))
+for(i in 1:ncol(norm.cds)){
+    if(exclude.zeros){
+        nonzero.idx <- which(norm.cds[,i] != 0)
+    }else{
+        nonzero.idx <- 1:nrow(norm.cds)
+    }
+    model <- lm(norm.cds[nonzero.idx,i]~as.factor(factor.cds[nonzero.idx,"Sex"]))
+    f <- summary(model)$fstatistic
+    p <- pf(f[1],f[2],f[3],lower.tail=F)
+    boxplot(norm.cds[nonzero.idx,i]~as.factor(factor.cds[nonzero.idx,"Sex"]), 
+        ylab = colnames(norm.cds)[i],
+        main = paste(colnames(norm.cds)[i], "\np =", signif(p, 2)), xlab = "")
+}
+```
+
+
+
+### Trait Correlations
+
+The following plot shows that global CDS
+is dominated by classical disease.
+It also shows that CDS in classical 
+disease and AR are unrelated to each other. 
+Lastly, it shows the correlations between the
+average weight Loss and the CDS data which are negative. This makes sense because weight loss is associated with higher disease severity.
+
+```{r trait_cor_cds_log_trans, fig.width = 8, fig.height = 12}
+trait.pairs <- pair.matrix(1:ncol(norm.cds))
+par(mfrow = c(3,2))
+for(i in 1:nrow(trait.pairs)){
+    trait1 <- trait.pairs[i,1]
+    trait2 <- trait.pairs[i,2]
+    if(exclude.zeros){
+        nonzero.idx <- intersect(which(norm.cds[,trait1] != 0), which(norm.cds[,trait2] != 0))
+    }else{
+        nonzero.idx <- 1:nrow(norm.cds)
+    }
+    plot.with.model(norm.cds[nonzero.idx,trait1], norm.cds[nonzero.idx,trait2],
+        xlab = colnames(norm.cds)[trait1], ylab = colnames(norm.cds)[trait2],
+        main = paste(colnames(norm.cds)[trait1], "vs.", colnames(norm.cds)[trait2]))
+}
+```
+
+```{r expand_matrices_cds_batch_log_trans}
+
+#remove any strains not used in mapping
+mapping.strain.idx <- unlist(sapply(mapping.strains, function(x) grep(x, pheno.strains)))
+pheno.strains_cds <- pheno.strains[mapping.strain.idx]
+
+#make a unique ID for each mouse that contains its strain and sex
+u_id <- as.vector(apply(cds[mapping.strain.idx,c(1:2,5)], 1, function(x) paste(x, collapse = "_")))
+
+K.idx <- sapply(mapping.strains, function(x) grep(x, rownames(mapping.K[[1]])))
+K.num <- sapply(mapping.strains, function(x) length(which(pheno.strains_cds == x)))
+expanded.idx <- unlist(lapply(1:length(K.idx), function(x) rep(K.idx[x], K.num[x])))
+groups <- names(expanded.idx)
+
+exp.K <- lapply(1:length(mapping.K), function(x) mapping.K[[x]][expanded.idx,expanded.idx])
+names(exp.K) <- names(mapping.K)
+
+#create unique row and column names
+for(i in 1:length(exp.K)){
+    rownames(exp.K[[i]]) <- colnames(exp.K[[i]]) <- 1:length(u_id)
+}
+
+expanded.genoprobs <- mapping.genoprobs
+for(i in 1:length(expanded.genoprobs)){
+    expanded.genoprobs[[i]] <- mapping.genoprobs[[i]][expanded.idx,,]
+    rownames(expanded.genoprobs[[i]]) <- 1:length(u_id)
+}
+
+#align the phenotypes with the strains
+covar <- matrix(as.numeric(as.factor(cds[mapping.strain.idx,"Sex"])), ncol = 1)
+rownames(covar) <- 1:length(u_id)
+
+mapping.pheno <- norm.cds[mapping.strain.idx,]
+rownames(mapping.pheno) <- 1:length(u_id)
+
+mapping.factors <- factor.cds[mapping.strain.idx,]
+mapping.covar <- matrix(as.numeric(as.factor(mapping.factors[,"Sex"])), ncol = 1)
+rownames(mapping.covar) <- 1:length(u_id)
+
+```
+
+### Heritability
+
+```{r herit_cds_batch_log_trans, fig.width = 7, fig.height = 5}
+overall.k.file <- here("Data",paste0("kinship_overall_cds",file_added_name,".RDS"))
+if(!file.exists(overall.k.file) || overwrite_previous){
+    overall.K <- calc_kinship(expanded.genoprobs, "overall")
+    saveRDS(overall.K, overall.k.file)
+}else{
+    overall.K <- readRDS(overall.k.file)
+}
+
+ind.herit <- rep(NA, ncol(num.cds))
+names(ind.herit) <- colnames(num.cds)
+for(i in 1:ncol(num.cds)){
+    nonzero.idx <- which(mapping.pheno[,i] != 0)
+    ind.herit[i] <- est_herit(mapping.pheno[nonzero.idx,i,drop=FALSE], overall.K)
+}
+
+barplot_with_num(round(ind.herit, 2), ylab = "Heritability", xlab = "", 
+    ylim = c(0, 0.4), text.shift = 0.09, main = "Trait Heritability Estimates")
+```
+
+
+
+
+```{r map_cds_batch_log_trans, warning = FALSE}
+
+cds.scans <- map_pheno(expanded.genoprobs, mapping.pheno, exp.K,
+    addcovar = covar, exclude.zeros = exclude.zeros,results.file = file.path(results.dir, paste0("scan1_results_cds",file_added_name,".RDS")))
+
+
+
+if(run_permutations){
+    #perm_strata <- names(expanded.idx)
+    #names(perm_strata) <- rownames(mapping.pheno)
+    #cds.perm <- scan1perm(expanded.genoprobs, mapping.pheno, kinship = exp.K,
+    #    addcovar = covar, perm_strata = perm_strata, n_perm = nperm, cores = detectCores()-1)
+
+    #cds.perm <- scan1perm(expanded.genoprobs, mapping.pheno, kinship = exp.K,
+    #    addcovar = covar, n_perm = nperm, cores = detectCores()-1)
+
+    cds.perm <- perm_scans(expanded.genoprobs, mapping.pheno, exp.K,
+        cds.scans, addcovar = covar, groups = names(expanded.idx),
+        exclude.zeros = exclude.zeros, nperm = nperm,
+        results.file = file.path(results.dir, paste0("scan1perm_results_cds_perm_scans",file_added_name,".RDS")))
+}
+```
+
+### CDS by individual LOD traces for Batch, Log Transformation {.tabset .tabset-fade .tabset-pills}
+
+```{r plot_cds_scans_batch_log_trans, fig.width = 10, fig.height = 4, warning = FALSE, results = "asis"}
+#plot the scans, and FDR results
+if(run_permutations){
+    #pdf("~/Desktop/test.pdf")
+    fdr_summaries_cds <- plot_fdr_fun(scan.results = cds.scans, perm.results = cds.perm,
+        tab.level = "#####", maxy = NULL)
+    #sig_summaries_cds <- plot_pval_fun(scan.results = cds.scans, perm.results = cds.perm, tab.level = "####")
+    #dev.off()
+}else{
+    for(i in 1:length(cds.scans)){
+        cat("#####", names(cds.scans)[i], "\n")
+        plot(cds.scans[[i]], map = map)
+        cat("\n\n")
+    }
+}
+```
+
+
+
+### LOD intervals for Batch, Log Transformation {.tabset .tabset-fade .tabset-pills}
+
+```{r lod_peaks_cds_batch_log_trans, results = "asis"}
+top.n <- 5
+for(ph in 1:length(cds.scans)){
+    cat("#####", names(cds.scans)[ph], "\n")
+    peak.table <- find_peaks(cds.scans[[ph]], map = map, prob = 0.95)
+    lod.order <- order(peak.table[,"lod"], decreasing = TRUE)
+    top.peaks <- peak.table[lod.order[1:top.n],3:ncol(peak.table)]
+    rownames(top.peaks) <- NULL
+    print(kable(top.peaks))
+    cat("Thresholds:\n")
+    print(kable(fdr_summaries_cds[ph,,drop=FALSE]))
+    cat("\n\n")
+}
+```
+
+
+
+#### Average Weight Loss by individual allele effects {.tabset .tabset-fade .tabset-pills}
+
+The following plot shows the allele effects for the Chr 2
+QTL for Average Weight Loss. The methods for plotting this
+chromosome and phenotype are the same done for Global CDS previously, including
+the two separate plots with x-limit perimeters modified 
+as appropriate.
+
+```{r av_weight_Loss_detail, fig.height = 8, fig.width = 8}
+
+#round genotypes to squash out the wild associations we 
+#get with teeny tiny probabilities
+rounded.geno <- expanded.genoprobs
+for(i in 1:length(rounded.geno)){
+    rounded.geno[[i]] <- round(rounded.geno[[i]], 2)
+}
+
+# chr = 2
+# av_weight_Loss.lod <- scan1(rounded.geno[,chr], mapping.pheno[,"Avg.Weight.Loss"], exp.K[[chr]],
+#     addcovar = covar)
+# av_weight_Loss.coef <- scan1coef(rounded.geno[,chr], mapping.pheno[,"Avg.Weight.Loss"], exp.K[[chr]],
+#     addcovar = covar)
+# 
+# plot_coefCC(av_weight_Loss.coef, map = map, scan1_output = av_weight_Loss.lod,
+#     ylim = c(-2, 2), col = strain.colors, main = "Avg Weight Loss full Chr 2",
+#     top_panel_prop = 0.5)
+# 
+# 
+# plot_coefCC(av_weight_Loss.coef, map = map, scan1_output = av_weight_Loss.lod,
+#     ylim = c(-2, 2), col = strain.colors, xlim = c(145, 180),
+#     main = "Avg Weight Loss Chr 2 QTL Window", top_panel_prop = 0.5)
+
+chr_list = c(2,14,15,17,19)
+interval_list = list(c(125, 175), c(95,125), c(55, 74), c(3, 72), c(44, 57))
+
+for(i in 1:length(chr_list)){
+
+# for Average Weight Loss
+av_weight_Loss.lod <- scan1(rounded.geno[,chr_list[i]], mapping.pheno[,"Avg.Weight.Loss"], exp.K[[chr_list[i]]],
+    addcovar = covar)
+av_weight_Loss.coef <- scan1coef(rounded.geno[,chr_list[i]], mapping.pheno[,"Avg.Weight.Loss"], exp.K[[chr_list[i]]],
+    addcovar = covar)
+
+plot_coefCC(av_weight_Loss.coef, map = map, scan1_output = av_weight_Loss.lod,
+    ylim = c(-2, 2), col = strain.colors, main = paste0("Avg Weight Loss full Chr ", chr_list[i]),
+    top_panel_prop = 0.5)
+
+
+plot_coefCC(av_weight_Loss.coef, map = map, scan1_output = av_weight_Loss.lod,
+    ylim = c(-2, 2), col = strain.colors, xlim = interval_list[[i]],
+    main = paste0("Avg Weight Loss Chr ", chr_list[i],  " QTL Window"), top_panel_prop = 0.5)
+}
+
+```
+
+
+## Log Transformation with Shifted Data
+
+Instead of transforming the original weight change and loss data which both have negative values, this will shift the data to start at zero.
+
+
+### Batch, Log Transformation Set Up
+
+```{r parameters_and_start_up_batch_log_trans_shift}
+
+# preparing to make new files for the new data processing method
+file_added_name = 'batch_log_trans_shift' 
+
+# Using the flexibility from the previous code, these parameters will be updated
+final_param = TRUE
+
+if(final_param){
+    b6_correction <- FALSE
+    batch_as_covar <- TRUE
+    rank_norm <- FALSE
+    log_trans <- TRUE
+}
+#===============================================================
+
+if(is.na(b6_correction) || length(b6_correction) == 0){
+b6_correction = FALSE; batch_as_covar = FALSE; rank_norm = FALSE
+}
+
+if(b6_correction && batch_as_covar){stop("Set either b6_correction or batch_as_covar to TRUE, not both.")}
+
+alpha <- c(0.05, 0.2)
+
+overwrite_previous <- FALSE # make this true whenever you add new data that you want fully analyzed; this WILL take longer and may not work on a low powered machine
+add_founder_genotypes <- FALSE
+
+#strains identified by remove_strains are excluded from all
+#manipulations including normalization and batch corrections.
+#justficiations are as follows:
+#CC027 - all but 2 were homozygous for the wrong genotype at the H2 locus
+#NOD and 129 - are not used for mapping, and were not included in all
+#batches, so we cannot use them for normalization
+#remove_strains <- NULL
+remove_strains <- c("CC027", "NOD", "129")
+#remove_strains <- c("CC051", "CC059") #closely related
+#remove_strains <- c("CC051") #pick one of them to keep
+
+cc.color.scheme = "original"
+#cc.color.scheme = "new"
+
+#for calculations
+exclude.zeros = FALSE #if true, we exclude animals with a CDS of 0
+disease.thresh = 0 #maximum disease score considered disease-free
+
+nperm = 1000
+
+if(nperm > 0){
+    run_permutations <- TRUE
+}else{
+    run_permutations <- FALSE
+}
+
+if(add_founder_genotypes){
+    founders.included = "yes"
+}else{
+    founders.included = "no"
+}
+
+if(length(remove_strains) > 0){
+    strains.removed <- paste(remove_strains, collapse = ", ")
+}else{
+    strains.removed = "none"
+}
+
+if(!exclude.zeros){
+    zero.text <- "Zeros are included in CDS"
+    zero.treatment <- "included with"
+}else{
+    zero.text <- paste("Animals with scores of", disease.thresh, "and below are excluded from CDS.")
+    zero.treatment <- "excluded from"
+}
+
+if(b6_correction){
+    correction.text <- "Batch corrections were made using B6 CDS."
+    correction.label <- "B6-batch"
+}
+if(batch_as_covar){
+    correction.text <- "Batch corrections were done using batch as a covariate."
+    correction.label <- "covar-batch"
+}
+if(!b6_correction && !batch_as_covar){
+    correction.text <- "No batch corrections were done."
+    correction.label <- "no-batch"
+}
+
+if(rank_norm){
+    norm.text <- "Rank Z normalization was performed."
+    norm.label <- "rank-norm"
+}else if (log_trans){
+    norm.text <- "Log Transformation was performed"
+    norm.label <- 'log-trans'
+}else{
+    norm.text <- "Rank Z normalization was not performed."
+    norm.label <- "no-norm"
+}
+
+file.label <- paste(correction.label, norm.label, genotypes, sep = "_")
+```
+
+The parameters for this run are as follows:
+
+* Genotypes used: `r genotypes`
+
+* Founders included: `r founders.included`
+
+* CC Strains removed: `r strains.removed`
+
+* Treatment of zeros: `r zero.text`
+
+* Batch correction: `r correction.text`
+
+* Normalization: `r norm.text`
+
+```{r reload_data_batch_log_trans_shift}
+if(cc.color.scheme == "original"){
+    strain.colors <- CCorigcolors
+}else{
+    strain.colors <- CCcolors
+}
+
+cds <- read.csv(here("Data", paste0("CDS_", cds.file.date, ".csv")), strip.white = TRUE)
+
+
+#take out any slashes in strain names
+cds[,"Strain"]  <- gsub("/", "", cds[,"Strain"], fixed = TRUE)
+
+```
+
+```{r remove_strains_batch_log_trans_shift}
+#remove any empty rows that were inserted to visually separate
+#the founders from the rest of the strains
+cds.data.idx <- which(!is.na(cds[,"ID"]))
+cds <- cds[cds.data.idx,]
+
+
+#remove specified strains from cds
+if(length(remove_strains) != 0){
+    remove.cds <- unlist(sapply(remove_strains, function(x) which(cds[,"Strain"] == x)))
+    cds <- cds[-remove.cds,]
+}
+
+
+```
+
+
+```{r batches_batch_log_trans_shift}
+## CDS
+num.cds <- as.matrix(sapply(cds[,c( "Global.CDS", "Avg.Weight.Change","Avg.Weight.Loss", "Weight.D0")], as.numeric)) #had to change this with Chat to make the values numeric
+rownames(num.cds) <- cds[,"ID"]
+
+# shift all values so that the lowest score is zero
+for(colnum in 1:ncol(num.cds)){
+  num.cds[,colnum] = num.cds[,colnum] + abs(min((num.cds[,colnum]), na.rm = TRUE))
+}
+
+
+#set all scores equal to or lower than the disease threshold
+#to zero
+if(exclude.zeros){
+    num.cds[which(num.cds <= disease.thresh)] <- 0
+}
+
+factor.cds <- as.matrix(cds[,c("Strain", "Sex")])
+u_batch <- unique(cds[,"EXP"])
+
+#remove animals in batch 170 - these were validation, not part of the original experiment
+to.remove = "X170"
+keep.batch <- which(u_batch != "X170")
+u_batch <- u_batch[keep.batch]
+
+keep.idx <- which(cds[,"EXP"] != "X170")
+cds <- cds[keep.idx,]
+num.cds <- num.cds[keep.idx,]
+factor.cds <- factor.cds[keep.idx,]
+
+batch.mat <- matrix(0, nrow = nrow(cds), ncol = length(u_batch))
+colnames(batch.mat) <- u_batch
+for(b in 1:ncol(batch.mat)){
+    batch.mat[which(cds[,"EXP"] == u_batch[b]),b] <- 1
+}
+cds.covar <- as.matrix(cbind(batch.mat, cds[,"Age.at.D0",drop=FALSE]))
+
+pheno.strains <- cds[,"Strain"]
+eae.strains <- unique(pheno.strains)
+
+
+```
+
+
+```{r adj_cds_batch_log_trans_shift}
+#choose which phenotypes to batch
+#correct using their indices.
+cds.idx <- c(1,2,3,4)
+adj.cds <- num.cds
+
+if(batch_as_covar){
+    adj.cds <- adjust(num.cds, cds.covar[,1:ncol(cds.covar)-1])
+}
+```
+
+
+
+```{r adjust_age_cds_batch_log_trans_shift, eval = FALSE}
+#adjust for age
+for(i in 1:ncol(adj.cds)){
+    if(exclude.zeros){
+        nonzero.idx <- which(num.cds[,i] != 0)
+    }else{
+        nonzero.idx <- 1:nrow(num.cds)
+    }
+    adj.cds[nonzero.idx,i] <- adjust(adj.cds[nonzero.idx,i,drop=FALSE],
+        cds.covar[nonzero.idx,"Age.at.D0",drop=FALSE])
+}
+
+#write out the results of whatever adjustments we have done
+write.table(adj.cds, file.path(results.dir, paste0("Adj_CDS", file_added_name, ".csv")), sep = ",", quote = FALSE)
+```
+
+```{r no_norm_cds_batch_log_trans_shift}
+norm.cds <- adj.cds
+colnames(norm.cds) <- gsub(".CDS", "", colnames(norm.cds)) #take off CDS in labels, to save room in plots
+
+if(rank_norm){
+    for(i in 1:ncol(norm.cds)){
+        if(exclude.zeros){
+            nonzero.idx <- which(num.cds[,i] != 0)
+        }else{
+            nonzero.idx <- 1:nrow(num.cds)
+        }
+        norm.cds[nonzero.idx,i] <- rankZ(adj.cds[nonzero.idx,i])
+    }
+}
+
+if(log_trans){
+    for(i in 1:ncol(norm.cds)){
+        if(exclude.zeros){
+            nonzero.idx <- which(num.cds[,i] != 0)
+        }else{
+            nonzero.idx <- 1:nrow(num.cds)
+        }
+      if (min(adj.cds[,i])<0){
+        adj.cds <- adj.cds - min(adj.cds[,i])
+      }  
+        norm.cds[nonzero.idx,i] <- log(adj.cds[nonzero.idx,i]+1)
+    }
+}
+colnames(norm.cds) <- gsub(".CDS", "", colnames(norm.cds)) #take off CDS, to save room in plots
+
+#write out normzliaed values
+write.table(norm.cds, file.path(results.dir, paste0("Norm_CDS",file_added_name,".csv")), sep = ",", quote = FALSE)
+
+```
+
+
+
+```{r methods_batch_log_trans_shift}
+if(add_founder_genotypes){
+    methods.line <- "Both CC and founder strains were used for mapping."
+}else{
+    methods.line <- "We used only CC strains for mapping."
+}
+
+if(length(remove_strains) != 0){
+    remove.line <- paste("We excluded the following strains:", paste(remove_strains, collapse = ", "))
+}else{
+    remove.line <- "No CC strains were excluded."
+}
+
+
+```
+
+`r methods.line`
+`r remove.line`
+
+### Normalized Scores {.tabset .tabset-fade .tabset-pills}
+
+This is post processing
+```{r norm_dist_CDS_log_trans_shift, fig.width = 10, fig.height = 5, results = "asis"}
+#ymin = min(norm.cds);ymax = max(norm.cds) #all on same axes
+ymin = NULL; ymax = NULL #all on independend axes
+for(cd in 1:ncol(norm.cds)){
+    cat("####", colnames(norm.cds)[cd], "\n")
+    plot_qtl_by_strain(scores = norm.cds[,cd], 
+        strain.labels = factor.cds[,"Strain"], exclude.zeros = exclude.zeros,
+        ymin = ymin, ymax = ymax, plot.label = colnames(num.cds)[cd])
+    cat("\n\n")
+}
+
+```
+
+### Overall Sex Effect
+
+```{r sex_diff_cds_batch_log_trans_shift}
+#quartz(width = 8, height = 8)
+par(mfrow = c(2,2))
+for(i in 1:ncol(norm.cds)){
+    if(exclude.zeros){
+        nonzero.idx <- which(norm.cds[,i] != 0)
+    }else{
+        nonzero.idx <- 1:nrow(norm.cds)
+    }
+    model <- lm(norm.cds[nonzero.idx,i]~as.factor(factor.cds[nonzero.idx,"Sex"]))
+    f <- summary(model)$fstatistic
+    p <- pf(f[1],f[2],f[3],lower.tail=F)
+    boxplot(norm.cds[nonzero.idx,i]~as.factor(factor.cds[nonzero.idx,"Sex"]), 
+        ylab = colnames(norm.cds)[i],
+        main = paste(colnames(norm.cds)[i], "\np =", signif(p, 2)), xlab = "")
+}
+```
+
+
+
+### Trait Correlations
+
+The following plot shows that global CDS
+is dominated by classical disease.
+It also shows that CDS in classical 
+disease and AR are unrelated to each other. 
+Lastly, it shows the correlations between the
+average weight Loss and the CDS data which are negative. This makes sense because weight loss is associated with higher disease severity.
+
+```{r trait_cor_cds_log_trans_shift, fig.width = 8, fig.height = 12}
+trait.pairs <- pair.matrix(1:ncol(norm.cds))
+par(mfrow = c(3,2))
+for(i in 1:nrow(trait.pairs)){
+    trait1 <- trait.pairs[i,1]
+    trait2 <- trait.pairs[i,2]
+    if(exclude.zeros){
+        nonzero.idx <- intersect(which(norm.cds[,trait1] != 0), which(norm.cds[,trait2] != 0))
+    }else{
+        nonzero.idx <- 1:nrow(norm.cds)
+    }
+    plot.with.model(norm.cds[nonzero.idx,trait1], norm.cds[nonzero.idx,trait2],
+        xlab = colnames(norm.cds)[trait1], ylab = colnames(norm.cds)[trait2],
+        main = paste(colnames(norm.cds)[trait1], "vs.", colnames(norm.cds)[trait2]))
+}
+```
+
+```{r expand_matrices_cds_batch_log_trans_shift}
+
+#remove any strains not used in mapping
+mapping.strain.idx <- unlist(sapply(mapping.strains, function(x) grep(x, pheno.strains)))
+pheno.strains_cds <- pheno.strains[mapping.strain.idx]
+
+#make a unique ID for each mouse that contains its strain and sex
+u_id <- as.vector(apply(cds[mapping.strain.idx,c(1:2,5)], 1, function(x) paste(x, collapse = "_")))
+
+K.idx <- sapply(mapping.strains, function(x) grep(x, rownames(mapping.K[[1]])))
+K.num <- sapply(mapping.strains, function(x) length(which(pheno.strains_cds == x)))
+expanded.idx <- unlist(lapply(1:length(K.idx), function(x) rep(K.idx[x], K.num[x])))
+groups <- names(expanded.idx)
+
+exp.K <- lapply(1:length(mapping.K), function(x) mapping.K[[x]][expanded.idx,expanded.idx])
+names(exp.K) <- names(mapping.K)
+
+#create unique row and column names
+for(i in 1:length(exp.K)){
+    rownames(exp.K[[i]]) <- colnames(exp.K[[i]]) <- 1:length(u_id)
+}
+
+expanded.genoprobs <- mapping.genoprobs
+for(i in 1:length(expanded.genoprobs)){
+    expanded.genoprobs[[i]] <- mapping.genoprobs[[i]][expanded.idx,,]
+    rownames(expanded.genoprobs[[i]]) <- 1:length(u_id)
+}
+
+#align the phenotypes with the strains
+covar <- matrix(as.numeric(as.factor(cds[mapping.strain.idx,"Sex"])), ncol = 1)
+rownames(covar) <- 1:length(u_id)
+
+mapping.pheno <- norm.cds[mapping.strain.idx,]
+rownames(mapping.pheno) <- 1:length(u_id)
+
+mapping.factors <- factor.cds[mapping.strain.idx,]
+mapping.covar <- matrix(as.numeric(as.factor(mapping.factors[,"Sex"])), ncol = 1)
+rownames(mapping.covar) <- 1:length(u_id)
+
+```
+
+### Heritability
+
+```{r herit_cds_batch_log_trans_shift, fig.width = 7, fig.height = 5}
+overall.k.file <- here("Data",paste0("kinship_overall_cds",file_added_name,".RDS"))
+if(!file.exists(overall.k.file) || overwrite_previous){
+    overall.K <- calc_kinship(expanded.genoprobs, "overall")
+    saveRDS(overall.K, overall.k.file)
+}else{
+    overall.K <- readRDS(overall.k.file)
+}
+
+ind.herit <- rep(NA, ncol(num.cds))
+names(ind.herit) <- colnames(num.cds)
+for(i in 1:ncol(num.cds)){
+    nonzero.idx <- which(mapping.pheno[,i] != 0)
+    ind.herit[i] <- est_herit(mapping.pheno[nonzero.idx,i,drop=FALSE], overall.K)
+}
+
+barplot_with_num(round(ind.herit, 2), ylab = "Heritability", xlab = "", 
+    ylim = c(0, 0.4), text.shift = 0.09, main = "Trait Heritability Estimates")
+```
+
+
+
+
+```{r map_cds_batch_log_trans_shift, warning = FALSE}
+
+cds.scans <- map_pheno(expanded.genoprobs, mapping.pheno, exp.K,
+    addcovar = covar, exclude.zeros = exclude.zeros,results.file = file.path(results.dir, paste0("scan1_results_cds",file_added_name,".RDS")))
+
+
+
+if(run_permutations){
+    #perm_strata <- names(expanded.idx)
+    #names(perm_strata) <- rownames(mapping.pheno)
+    #cds.perm <- scan1perm(expanded.genoprobs, mapping.pheno, kinship = exp.K,
+    #    addcovar = covar, perm_strata = perm_strata, n_perm = nperm, cores = detectCores()-1)
+
+    #cds.perm <- scan1perm(expanded.genoprobs, mapping.pheno, kinship = exp.K,
+    #    addcovar = covar, n_perm = nperm, cores = detectCores()-1)
+
+    cds.perm <- perm_scans(expanded.genoprobs, mapping.pheno, exp.K,
+        cds.scans, addcovar = covar, groups = names(expanded.idx),
+        exclude.zeros = exclude.zeros, nperm = nperm,
+        results.file = file.path(results.dir, paste0("scan1perm_results_cds_perm_scans",file_added_name,".RDS")))
+}
+```
+
+### CDS by individual LOD traces for Batch, Log Transformation {.tabset .tabset-fade .tabset-pills}
+
+```{r plot_cds_scans_batch_log_trans_shift, fig.width = 10, fig.height = 4, warning = FALSE, results = "asis"}
+#plot the scans, and FDR results
+if(run_permutations){
+    #pdf("~/Desktop/test.pdf")
+    fdr_summaries_cds <- plot_fdr_fun(scan.results = cds.scans, perm.results = cds.perm,
+        tab.level = "#####", maxy = NULL)
+    #sig_summaries_cds <- plot_pval_fun(scan.results = cds.scans, perm.results = cds.perm, tab.level = "####")
+    #dev.off()
+}else{
+    for(i in 1:length(cds.scans)){
+        cat("#####", names(cds.scans)[i], "\n")
+        plot(cds.scans[[i]], map = map)
+        cat("\n\n")
+    }
+}
+```
+
+
+
+### LOD intervals for Batch, Log Transformation {.tabset .tabset-fade .tabset-pills}
+
+```{r lod_peaks_cds_batch_log_trans_shift, results = "asis"}
+top.n <- 5
+for(ph in 1:length(cds.scans)){
+    cat("#####", names(cds.scans)[ph], "\n")
+    peak.table <- find_peaks(cds.scans[[ph]], map = map, prob = 0.95)
+    lod.order <- order(peak.table[,"lod"], decreasing = TRUE)
+    top.peaks <- peak.table[lod.order[1:top.n],3:ncol(peak.table)]
+    rownames(top.peaks) <- NULL
+    print(kable(top.peaks))
+    cat("Thresholds:\n")
+    print(kable(fdr_summaries_cds[ph,,drop=FALSE]))
+    cat("\n\n")
+}
+```
+
+
+
+#### Average Weight Loss by individual allele effects {.tabset .tabset-fade .tabset-pills}
+
+The following plot shows the allele effects for the Chr 2
+QTL for Average Weight Loss. The methods for plotting this
+chromosome and phenotype are the same done for Global CDS previously, including
+the two separate plots with x-limit perimeters modified 
+as appropriate.
+
+```{r av_weight_Loss_detail_shift, fig.height = 8, fig.width = 8}
+
+#round genotypes to squash out the wild associations we 
+#get with teeny tiny probabilities
+rounded.geno <- expanded.genoprobs
+for(i in 1:length(rounded.geno)){
+    rounded.geno[[i]] <- round(rounded.geno[[i]], 2)
+}
+
+# chr = 2
+# av_weight_Loss.lod <- scan1(rounded.geno[,chr], mapping.pheno[,"Avg.Weight.Loss"], exp.K[[chr]],
+#     addcovar = covar)
+# av_weight_Loss.coef <- scan1coef(rounded.geno[,chr], mapping.pheno[,"Avg.Weight.Loss"], exp.K[[chr]],
+#     addcovar = covar)
+# 
+# plot_coefCC(av_weight_Loss.coef, map = map, scan1_output = av_weight_Loss.lod,
+#     ylim = c(-2, 2), col = strain.colors, main = "Avg Weight Loss full Chr 2",
+#     top_panel_prop = 0.5)
+# 
+# 
+# plot_coefCC(av_weight_Loss.coef, map = map, scan1_output = av_weight_Loss.lod,
+#     ylim = c(-2, 2), col = strain.colors, xlim = c(145, 180),
+#     main = "Avg Weight Loss Chr 2 QTL Window", top_panel_prop = 0.5)
+
+chr_list = c(2,14,15,17,19)
+interval_list = list(c(125, 175), c(95,125), c(55, 74), c(3, 72), c(44, 57))
+
+for(i in 1:length(chr_list)){
+
+# for Average Weight Loss
+av_weight_Loss.lod <- scan1(rounded.geno[,chr_list[i]], mapping.pheno[,"Avg.Weight.Loss"], exp.K[[chr_list[i]]],
+    addcovar = covar)
+av_weight_Loss.coef <- scan1coef(rounded.geno[,chr_list[i]], mapping.pheno[,"Avg.Weight.Loss"], exp.K[[chr_list[i]]],
+    addcovar = covar)
+
+plot_coefCC(av_weight_Loss.coef, map = map, scan1_output = av_weight_Loss.lod,
+    ylim = c(-2, 2), col = strain.colors, main = paste0("Avg Weight Loss full Chr ", chr_list[i]),
+    top_panel_prop = 0.5)
+
+
+plot_coefCC(av_weight_Loss.coef, map = map, scan1_output = av_weight_Loss.lod,
+    ylim = c(-2, 2), col = strain.colors, xlim = interval_list[[i]],
+    main = paste0("Avg Weight Loss Chr ", chr_list[i],  " QTL Window"), top_panel_prop = 0.5)
+}
+
+```
